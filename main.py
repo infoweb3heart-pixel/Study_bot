@@ -675,11 +675,13 @@ async def run():
     application.add_handler(CommandHandler("quiz", quiz))
     application.add_handler(CommandHandler("topic", topic_deep_dive))
     application.add_handler(CommandHandler("flashcard", flashcard))
+    application.add_handler(CommandHandler("broadcast", broadcast))
     application.add_handler(CallbackQueryHandler(flashcard_button, pattern=r"^fc:"))
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
     )
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    application.add_handler(MessageHandler(filters.ALL, record_user), group=1)
 
     await application.initialize()
     await application.bot.set_webhook(url=f"{WEBHOOK_URL}/{TELEGRAM_TOKEN}")
