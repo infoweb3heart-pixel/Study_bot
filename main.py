@@ -31,6 +31,9 @@ TELEGRAM_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 WEBHOOK_URL = os.environ["WEBHOOK_URL"]  # e.g. https://your-app.onrender.com
 PORT = int(os.environ.get("PORT", 8443))
+# Your own numeric Telegram user ID, so only you can use /broadcast.
+# Get yours by messaging @userinfobot on Telegram.
+ADMIN_USER_ID = int(os.environ["ADMIN_USER_ID"])
 
 genai.configure(api_key=GEMINI_API_KEY)
 
@@ -616,6 +619,43 @@ async def handle_ai_reply(update: Update, user_text: str):
 async def health_check(request: web.Request) -> web.Response:
     # This is what UptimeRobot (or any pinger) should hit — always returns 200
     return web.Response(text="OK")
+    # --- Feature: broadcast a message to everyone who's used the bot ---
+# Resets on restart, same limitation as user_histories — fine for casual use.
+known_user_ids: set[int] = set()
+
+
+async def record_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user:
+        known_user_ids.add(update.effective_user.id)
+
+
+async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_USER_ID:
+        return  # silently ignore — don't reveal this command exists to others
+
+    message = " ".join(context.args)
+    if not message:
+        await update.message.reply_text("Usage: /broadcast <message>")
+        return
+
+    converted = to_telegram_markdown(message)
+    sent, failed = 0, 0
+
+    for user_id in list(known_user_ids):
+        try:
+            if converted is not None:
+                await context.bot.send_message(
+                    chat_id=user_id, text=converted, parse_mode=ParseMode.MARKDOWN_V2
+                )
+            else:
+                await context.bot.send_message(chat_id=user_id, text=message)
+            sent += 1
+        except Exception:
+            logger.exception("Broadcast failed for user_id=%s", user_id)
+            failed += 1
+        await asyncio.sleep(0.05)  # gentle pacing so we don't hit Telegram's rate limit
+
+    await update.message.reply_text(f"Broadcast sent to {sent} users ({failed} failed).")
 
 
 async def telegram_webhook(request: web.Request) -> web.Response:
