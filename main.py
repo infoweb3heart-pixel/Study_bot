@@ -32,11 +32,6 @@ GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 WEBHOOK_URL = os.environ["WEBHOOK_URL"]  # e.g. https://your-app.onrender.com
 PORT = int(os.environ.get("PORT", 8443))
 
-# Optional — only needed for the "find a real image" feature. If unset, that
-# feature just tells the user it's unavailable instead of crashing.
-GOOGLE_SEARCH_API_KEY = os.environ.get("GOOGLE_SEARCH_API_KEY")
-GOOGLE_SEARCH_ENGINE_ID = os.environ.get("GOOGLE_SEARCH_ENGINE_ID")
-
 genai.configure(api_key=GEMINI_API_KEY)
 
 SYSTEM_PROMPT = (
@@ -434,33 +429,58 @@ def is_image_request(text: str) -> bool:
     lowered = text.lower()
     return any(keyword in lowered for keyword in IMAGE_REQUEST_KEYWORDS)
 
-
-def search_google_image(query: str) -> str | None:
-    if not (GOOGLE_SEARCH_API_KEY and GOOGLE_SEARCH_ENGINE_ID):
-        logger.warning("Image search called but API key/CX not configured")
-        return None
+def search_wikimedia_image(query: str) -> str | None:
+    """Searches Wikimedia Commons for a real image matching the query.
+    Free, no API key required — reliable for biology/parasitology topics
+    since Commons/Wikipedia already host most organism photos and diagrams."""
     try:
-        resp = requests.get(
-            "https://www.googleapis.com/customsearch/v1",
+        search_resp = requests.get(
+            "https://commons.wikimedia.org/w/api.php",
             params={
-                "key": GOOGLE_SEARCH_API_KEY,
-                "cx": GOOGLE_SEARCH_ENGINE_ID,
-                "q": query,
-                "searchType": "image",
-                "num": 1,
-                "safe": "active",
+                "action": "query",
+                "list": "search",
+                "srsearch": query,
+                "srnamespace": 6,  # File namespace
+                "srlimit": 5,
+                "format": "json",
             },
+            headers={"User-Agent": "ParasitopiaBot/1.0"},
             timeout=10,
         )
-        resp.raise_for_status()
-        data = resp.json()
-        items = data.get("items")
-        if items:
-            return items[0]["link"]
-        logger.info("Image search returned no items. Full response: %s", data)
+        search_resp.raise_for_status()
+        results = search_resp.json().get("query", {}).get("search", [])
+        if not results:
+            logger.info("Wikimedia search returned no results for: %s", query)
+            return None
+
+        for result in results:
+            title = result["title"]
+            info_resp = requests.get(
+                "https://commons.wikimedia.org/w/api.php",
+                params={
+                    "action": "query",
+                    "titles": title,
+                    "prop": "imageinfo",
+                    "iiprop": "url|mime",
+                    "format": "json",
+                },
+                headers={"User-Agent": "ParasitopiaBot/1.0"},
+                timeout=10,
+            )
+            info_resp.raise_for_status()
+            pages = info_resp.json().get("query", {}).get("pages", {})
+            for page in pages.values():
+                imageinfo = page.get("imageinfo")
+                if imageinfo:
+                    mime = imageinfo[0].get("mime", "")
+                    url = imageinfo[0].get("url")
+                    # Skip SVGs — Telegram doesn't render them as photos
+                    if url and mime.startswith("image/") and "svg" not in mime:
+                        return url
+        return None
     except Exception:
-        logger.exception("Google image search failed")
-    return None
+        logger.exception("Wikimedia image search failed")
+        return None
 
 
 async def handle_image_search(update: Update, user_text: str):
@@ -470,15 +490,8 @@ async def handle_image_search(update: Update, user_text: str):
         await update.message.reply_text(limit_message)
         return
 
-    if not (GOOGLE_SEARCH_API_KEY and GOOGLE_SEARCH_ENGINE_ID):
-        await update.message.reply_text(
-            "Image search isn't set up yet on this bot. I can still explain "
-            "the topic in words if that helps — just ask me directly."
-        )
-        return
-
     await update.message.chat.send_action("upload_photo")
-    image_url = search_google_image(user_text)
+    image_url = search_wikimedia_image(user_text)
 
     if not image_url:
         await update.message.reply_text(
@@ -495,7 +508,7 @@ async def handle_image_search(update: Update, user_text: str):
         logger.exception("Sending found image failed")
         await update.message.reply_text(
             f"Found an image but couldn't send it directly. Link: {image_url}"
-        )
+)
 
 
 # --- Feature: user sends a photo, bot reads/explains it ---
