@@ -429,32 +429,46 @@ def is_image_request(text: str) -> bool:
     lowered = text.lower()
     return any(keyword in lowered for keyword in IMAGE_REQUEST_KEYWORDS)
 
-def search_wikimedia_image(query: str) -> str | None:
-    """Searches Wikimedia Commons for a real image matching the query.
-    Free, no API key required — reliable for biology/parasitology topics
-    since Commons/Wikipedia already host most organism photos and diagrams."""
-    try:
-        search_resp = requests.get(
-            "https://commons.wikimedia.org/w/api.php",
-            params={
-                "action": "query",
-                "list": "search",
-                "srsearch": query,
-                "srnamespace": 6,  # File namespace
-                "srlimit": 5,
-                "format": "json",
-            },
-            headers={"User-Agent": "ParasitopiaBot/1.0"},
-            timeout=10,
-        )
-        search_resp.raise_for_status()
-        results = search_resp.json().get("query", {}).get("search", [])
-        if not results:
-            logger.info("Wikimedia search returned no results for: %s", query)
-            return None
+def search_wikimedia_image(query: str) -> bytes | None:
+    """Searches Wikimedia Commons for a real image and downloads it directly
+    (Telegram sometimes fails to fetch certain Commons URLs itself). Tries a
+    title-focused search first for better relevance, falling back to a
+    broader keyword search if that finds nothing."""
 
-        for result in results:
-            title = result["title"]
+    def do_search(srsearch_query: str) -> list:
+        try:
+            resp = requests.get(
+                "https://commons.wikimedia.org/w/api.php",
+                params={
+                    "action": "query",
+                    "list": "search",
+                    "srsearch": srsearch_query,
+                    "srnamespace": 6,  # File namespace
+                    "srlimit": 8,
+                    "format": "json",
+                },
+                headers={"User-Agent": "ParasitopiaBot/1.0"},
+                timeout=10,
+            )
+            resp.raise_for_status()
+            return resp.json().get("query", {}).get("search", [])
+        except Exception:
+            logger.exception("Wikimedia search request failed")
+            return []
+
+    # Prefer results with the search terms in the actual file title — much
+    # more accurate than a plain keyword match against file descriptions,
+    # which is what was matching unrelated images before.
+    results = do_search(f"intitle:{query} filetype:bitmap")
+    if not results:
+        results = do_search(f"{query} filetype:bitmap")
+    if not results:
+        logger.info("Wikimedia search returned no results for: %s", query)
+        return None
+
+    for result in results:
+        title = result["title"]
+        try:
             info_resp = requests.get(
                 "https://commons.wikimedia.org/w/api.php",
                 params={
@@ -469,18 +483,33 @@ def search_wikimedia_image(query: str) -> str | None:
             )
             info_resp.raise_for_status()
             pages = info_resp.json().get("query", {}).get("pages", {})
-            for page in pages.values():
-                imageinfo = page.get("imageinfo")
-                if imageinfo:
-                    mime = imageinfo[0].get("mime", "")
-                    url = imageinfo[0].get("url")
-                    # Skip SVGs — Telegram doesn't render them as photos
-                    if url and mime.startswith("image/") and "svg" not in mime:
-                        return url
-        return None
-    except Exception:
-        logger.exception("Wikimedia image search failed")
-        return None
+        except Exception:
+            logger.exception("Wikimedia imageinfo request failed for %s", title)
+            continue
+
+        for page in pages.values():
+            imageinfo = page.get("imageinfo")
+            if not imageinfo:
+                continue
+            mime = imageinfo[0].get("mime", "")
+            url = imageinfo[0].get("url")
+            if not (url and mime.startswith("image/") and "svg" not in mime):
+                continue
+
+            # Download the bytes ourselves rather than handing Telegram the
+            # raw URL — more reliable than letting Telegram fetch it, which
+            # sometimes fails on certain Commons filenames/redirects.
+            try:
+                img_resp = requests.get(
+                    url, headers={"User-Agent": "ParasitopiaBot/1.0"}, timeout=15
+                )
+                img_resp.raise_for_status()
+                return img_resp.content
+            except Exception:
+                logger.exception("Downloading Wikimedia image failed: %s", url)
+                continue
+
+    return None
 
 
 async def handle_image_search(update: Update, user_text: str):
@@ -491,9 +520,9 @@ async def handle_image_search(update: Update, user_text: str):
         return
 
     await update.message.chat.send_action("upload_photo")
-    image_url = search_wikimedia_image(user_text)
+    image_bytes = search_wikimedia_image(user_text)
 
-    if not image_url:
+    if not image_bytes:
         await update.message.reply_text(
             "Couldn't find a matching image right now. Try rephrasing, or "
             "I can explain it in text instead."
@@ -502,14 +531,13 @@ async def handle_image_search(update: Update, user_text: str):
 
     try:
         await update.message.reply_photo(
-            photo=image_url, caption=f"Found this for: {user_text}"
+            photo=image_bytes, caption=f"Found this for: {user_text}"
         )
     except Exception:
         logger.exception("Sending found image failed")
         await update.message.reply_text(
-            f"Found an image but couldn't send it directly. Link: {image_url}"
+            "Found an image but couldn't send it. Try rephrasing your request."
 )
-
 
 # --- Feature: user sends a photo, bot reads/explains it ---
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
